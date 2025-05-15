@@ -1,0 +1,1000 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'AWS WAF Demonstration - Vulnerable and Protected Environments'
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: waf-demo
+    Description: Base name for all resources
+  
+  Stage:
+    Type: String
+    Default: demo
+    Description: Deployment stage (e.g., dev, test, demo)
+  
+  CreateWafProtection:
+    Type: String
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Description: Whether to create and apply AWS WAF protection
+
+Resources:
+  #############################################
+  # Common Resources (used by both environments)
+  #############################################
+  
+  # DynamoDB Table
+  ProductReviewsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${ProjectName}-product-reviews-${Stage}'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: review_id
+          AttributeType: S
+        - AttributeName: product_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: review_id
+          KeyType: HASH
+        - AttributeName: product_id
+          KeyType: RANGE
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+  
+  # S3 Bucket for frontend (private)
+  FrontendBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ProjectName}-frontend-${Stage}-${AWS::AccountId}'
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+  
+  # S3 Bucket Policy (restricted to CloudFront)
+  FrontendBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref FrontendBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: cloudfront.amazonaws.com
+            Action: 's3:GetObject'
+            Resource: !Sub 'arn:aws:s3:::${FrontendBucket}/*'
+            Condition:
+              StringEquals:
+                'AWS:SourceArn': !Sub 'arn:aws:cloudfront::${AWS::AccountId}:distribution/${CloudFrontDistribution}'
+  
+  # CloudFront Origin Access Control
+  CloudFrontOAC:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub '${ProjectName}-${Stage}-OAC'
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+  
+  # CloudFront Distribution
+  CloudFrontDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Comment: !Sub '${ProjectName}-${Stage} frontend distribution'
+        Enabled: true
+        DefaultRootObject: index.html
+        Origins:
+          - DomainName: !GetAtt FrontendBucket.RegionalDomainName
+            Id: S3Origin
+            OriginAccessControlId: !GetAtt CloudFrontOAC.Id
+            S3OriginConfig:
+              OriginAccessIdentity: ''
+        DefaultCacheBehavior:
+          TargetOriginId: S3Origin
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods:
+            - GET
+            - HEAD
+            - OPTIONS
+          CachedMethods:
+            - GET
+            - HEAD
+            - OPTIONS
+          ForwardedValues:
+            QueryString: false
+            Cookies:
+              Forward: none
+          MinTTL: 0
+          DefaultTTL: 3600
+          MaxTTL: 86400
+        CustomErrorResponses:
+          - ErrorCode: 403
+            ResponsePagePath: /index.html
+            ResponseCode: 200
+          - ErrorCode: 404
+            ResponsePagePath: /index.html
+            ResponseCode: 200
+        PriceClass: PriceClass_100
+        ViewerCertificate:
+          CloudFrontDefaultCertificate: true
+  
+  #############################################
+  # Unprotected Environment (Vulnerable)
+  #############################################
+  
+  # IAM Role for unprotected Lambda
+  UnprotectedLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+      Policies:
+        - PolicyName: DynamoDBAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'dynamodb:PutItem'
+                  - 'dynamodb:GetItem'
+                  - 'dynamodb:Query'
+                  - 'dynamodb:Scan'
+                Resource: !GetAtt ProductReviewsTable.Arn
+  
+  # Lambda function (vulnerable)
+  UnprotectedLambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-unprotected-function-${Stage}'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt UnprotectedLambdaRole.Arn
+      MemorySize: 128
+      Timeout: 10
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref ProductReviewsTable
+          ENVIRONMENT: unprotected
+          CLOUDFRONT_DOMAIN: !Sub 'https://${CloudFrontDistribution.DomainName}'
+      Code:
+        ZipFile: |
+          import json
+          import subprocess
+          import os
+          import boto3
+          from urllib.parse import parse_qs
+          import uuid
+          from boto3.dynamodb.conditions import Key, Attr
+
+          def lambda_handler(event, context):
+              try:
+                  # Add CORS headers
+                  headers = {
+                      'Access-Control-Allow-Origin': os.environ.get('CLOUDFRONT_DOMAIN', '*'),
+                      'Access-Control-Allow-Headers': 'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token,Origin,Accept',
+                      'Access-Control-Allow-Methods': 'GET,POST,OPTIONS',
+                      'Content-Type': 'application/json'
+                  }
+
+                  # Handle OPTIONS request for CORS preflight
+                  if event['httpMethod'] == 'OPTIONS':
+                      return {
+                          'statusCode': 200,
+                          'headers': headers,
+                          'body': ''
+                      }
+
+                  # Get request data
+                  if event['httpMethod'] == 'POST':
+                      if 'body' in event:
+                          # Parse request body
+                          if event.get('isBase64Encoded', False):
+                              import base64
+                              body = base64.b64decode(event['body']).decode('utf-8')
+                          else:
+                              body = event['body']
+                          
+                          # Parse as form data or JSON depending on content type
+                          content_type = event.get('headers', {}).get('content-type', '')
+                          if 'application/json' in content_type:
+                              data = json.loads(body)
+                              product_id = data.get('product_id', '')
+                              review_text = data.get('review', '')
+                              username = data.get('username', 'anonymous')
+                          else:
+                              # Parse as form data
+                              form_data = parse_qs(body)
+                              product_id = form_data.get('product_id', [''])[0]
+                              review_text = form_data.get('review', [''])[0]
+                              username = form_data.get('username', ['anonymous'])[0]
+                          
+                          # VULNERABLE CODE: Directly using user input in system commands without sanitization
+                          cmd = f"echo Checking product ID: {product_id}"
+                          output = subprocess.check_output(cmd, shell=True).decode('utf-8')
+                          
+                          # Store the review (simplified for demo)
+                          table_name = os.environ.get('TABLE_NAME')
+                          if table_name:
+                              dynamodb = boto3.resource('dynamodb')
+                              table = dynamodb.Table(table_name)
+                              
+                              review_id = str(uuid.uuid4())
+                              
+                              table.put_item(
+                                  Item={
+                                      'review_id': review_id,
+                                      'product_id': product_id,
+                                      'username': username,
+                                      'review_text': review_text,
+                                      'environment': os.environ.get('ENVIRONMENT', 'unknown')
+                                  }
+                              )
+                          
+                          # Return success response
+                          return {
+                              'statusCode': 200,
+                              'headers': headers,
+                              'body': json.dumps({
+                                  'message': 'Review submitted successfully',
+                                  'product_check': output.strip(),
+                                  'review_id': review_id
+                              })
+                          }
+                  
+                  # Handle GET requests
+                  if event['httpMethod'] == 'GET':
+                      # Get all reviews for a product ID
+                      params = event.get('queryStringParameters', {}) or {}
+                      product_id = params.get('product_id', '')
+                      
+                      if product_id:
+                          table_name = os.environ.get('TABLE_NAME')
+                          if table_name:
+                              dynamodb = boto3.resource('dynamodb')
+                              table = dynamodb.Table(table_name)
+                              
+                              # Use scan with filter instead of query
+                              response = table.scan(
+                                  FilterExpression=Attr('product_id').eq(product_id)
+                              )
+                              
+                              return {
+                                  'statusCode': 200,
+                                  'headers': headers,
+                                  'body': json.dumps({
+                                      'reviews': response.get('Items', [])
+                                  })
+                              }
+                      
+                      return {
+                          'statusCode': 400,
+                          'headers': headers,
+                          'body': json.dumps({
+                              'message': 'Missing product_id parameter'
+                          })
+                      }
+                  
+                  # Handle other cases
+                  return {
+                      'statusCode': 400,
+                      'headers': headers,
+                      'body': json.dumps({
+                          'message': 'Invalid request method or format'
+                      })
+                  }
+              
+              except Exception as e:
+                  # VULNERABLE ERROR HANDLING: Returning detailed error information
+                  return {
+                      'statusCode': 500,
+                      'headers': headers,
+                      'body': json.dumps({
+                          'message': 'Server error occurred',
+                          'error': str(e),
+                          'error_type': str(type(e).__name__)
+                      })
+                  }
+  
+  # Unprotected API Gateway
+  UnprotectedApi:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: !Sub '${ProjectName}-unprotected-api-${Stage}'
+      Description: 'Unprotected API for AWS WAF demonstration'
+      EndpointConfiguration:
+        Types:
+          - REGIONAL
+  
+  # API Gateway resource
+  UnprotectedApiResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref UnprotectedApi
+      ParentId: !GetAtt UnprotectedApi.RootResourceId
+      PathPart: 'reviews'
+  
+  # API Gateway methods
+  UnprotectedApiPostMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref UnprotectedApi
+      ResourceId: !Ref UnprotectedApiResource
+      HttpMethod: POST
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${UnprotectedLambdaFunction.Arn}/invocations'
+        IntegrationResponses:
+          - StatusCode: '200'
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Origin: !Sub "'https://${CloudFrontDistribution.DomainName}'"
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token,Origin,Accept'"
+              method.response.header.Access-Control-Allow-Methods: "'GET,POST,OPTIONS'"
+        PassthroughBehavior: WHEN_NO_MATCH
+        ContentHandling: CONVERT_TO_TEXT
+      MethodResponses:
+        - StatusCode: '200'
+          ResponseModels:
+            application/json: 'Empty'
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Origin: true
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+  
+  UnprotectedApiGetMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref UnprotectedApi
+      ResourceId: !Ref UnprotectedApiResource
+      HttpMethod: GET
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${UnprotectedLambdaFunction.Arn}/invocations'
+        IntegrationResponses:
+          - StatusCode: '200'
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Origin: !Sub "'https://${CloudFrontDistribution.DomainName}'"
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token,Origin,Accept'"
+              method.response.header.Access-Control-Allow-Methods: "'GET,POST,OPTIONS'"
+        PassthroughBehavior: WHEN_NO_MATCH
+        ContentHandling: CONVERT_TO_TEXT
+      MethodResponses:
+        - StatusCode: '200'
+          ResponseModels:
+            application/json: 'Empty'
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Origin: true
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+  
+  UnprotectedApiOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref UnprotectedApi
+      ResourceId: !Ref UnprotectedApiResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        IntegrationResponses:
+          - StatusCode: '200'
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token,Origin,Accept'"
+              method.response.header.Access-Control-Allow-Methods: "'GET,POST,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: !Sub "'https://${CloudFrontDistribution.DomainName}'"
+            ResponseTemplates:
+              application/json: '{}'
+        PassthroughBehavior: WHEN_NO_MATCH
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+      MethodResponses:
+        - StatusCode: '200'
+          ResponseModels:
+            application/json: 'Empty'
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+  
+  # API Gateway deployment
+  UnprotectedApiDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn:
+      - UnprotectedApiPostMethod
+      - UnprotectedApiGetMethod
+      - UnprotectedApiOptionsMethod
+    Properties:
+      RestApiId: !Ref UnprotectedApi
+      StageName: !Ref Stage
+      Description: !Sub 'Deployment for ${Stage} stage with CORS fix - ${AWS::StackName}-${AWS::Region}-${AWS::AccountId}-${AWS::StackId}'
+  
+  # Lambda permission for API Gateway
+  UnprotectedApiGatewayPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref UnprotectedLambdaFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${UnprotectedApi}/*/*/*'
+  
+  #############################################
+  # Protected Environment (with WAF)
+  #############################################
+  
+  # IAM Role for protected Lambda
+  ProtectedLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+      Policies:
+        - PolicyName: DynamoDBAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'dynamodb:PutItem'
+                  - 'dynamodb:GetItem'
+                  - 'dynamodb:Query'
+                  - 'dynamodb:Scan'
+                Resource: !GetAtt ProductReviewsTable.Arn
+  
+  # Lambda function (protected - same code as the vulnerable one)
+  ProtectedLambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-protected-function-${Stage}'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt ProtectedLambdaRole.Arn
+      MemorySize: 128
+      Timeout: 10
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref ProductReviewsTable
+          ENVIRONMENT: protected
+          CLOUDFRONT_DOMAIN: !Sub 'https://${CloudFrontDistribution.DomainName}'
+      Code:
+        ZipFile: |
+          import json
+          import subprocess
+          import os
+          import boto3
+          from urllib.parse import parse_qs
+          import uuid
+          from boto3.dynamodb.conditions import Key, Attr
+
+          def lambda_handler(event, context):
+              try:
+                  # Add CORS headers
+                  headers = {
+                      'Access-Control-Allow-Origin': os.environ.get('CLOUDFRONT_DOMAIN', '*'),
+                      'Access-Control-Allow-Headers': 'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token,Origin,Accept',
+                      'Access-Control-Allow-Methods': 'GET,POST,OPTIONS',
+                      'Content-Type': 'application/json'
+                  }
+
+                  # Handle OPTIONS request for CORS preflight
+                  if event['httpMethod'] == 'OPTIONS':
+                      return {
+                          'statusCode': 200,
+                          'headers': headers,
+                          'body': ''
+                      }
+
+                  # Get request data
+                  if event['httpMethod'] == 'POST':
+                      if 'body' in event:
+                          # Parse request body
+                          if event.get('isBase64Encoded', False):
+                              import base64
+                              body = base64.b64decode(event['body']).decode('utf-8')
+                          else:
+                              body = event['body']
+                          
+                          # Parse as form data or JSON depending on content type
+                          content_type = event.get('headers', {}).get('content-type', '')
+                          if 'application/json' in content_type:
+                              data = json.loads(body)
+                              product_id = data.get('product_id', '')
+                              review_text = data.get('review', '')
+                              username = data.get('username', 'anonymous')
+                          else:
+                              # Parse as form data
+                              form_data = parse_qs(body)
+                              product_id = form_data.get('product_id', [''])[0]
+                              review_text = form_data.get('review', [''])[0]
+                              username = form_data.get('username', ['anonymous'])[0]
+                          
+                          # VULNERABLE CODE: Directly using user input in system commands without sanitization
+                          cmd = f"echo Checking product ID: {product_id}"
+                          output = subprocess.check_output(cmd, shell=True).decode('utf-8')
+                          
+                          # Store the review (simplified for demo)
+                          table_name = os.environ.get('TABLE_NAME')
+                          if table_name:
+                              dynamodb = boto3.resource('dynamodb')
+                              table = dynamodb.Table(table_name)
+                              
+                              review_id = str(uuid.uuid4())
+                              
+                              table.put_item(
+                                  Item={
+                                      'review_id': review_id,
+                                      'product_id': product_id,
+                                      'username': username,
+                                      'review_text': review_text,
+                                      'environment': os.environ.get('ENVIRONMENT', 'unknown')
+                                  }
+                              )
+                          
+                          # Return success response
+                          return {
+                              'statusCode': 200,
+                              'headers': headers,
+                              'body': json.dumps({
+                                  'message': 'Review submitted successfully',
+                                  'product_check': output.strip(),
+                                  'review_id': review_id
+                              })
+                          }
+                  
+                  # Handle GET requests
+                  if event['httpMethod'] == 'GET':
+                      # Get all reviews for a product ID
+                      params = event.get('queryStringParameters', {}) or {}
+                      product_id = params.get('product_id', '')
+                      
+                      if product_id:
+                          table_name = os.environ.get('TABLE_NAME')
+                          if table_name:
+                              dynamodb = boto3.resource('dynamodb')
+                              table = dynamodb.Table(table_name)
+                              
+                              # Use scan with filter instead of query
+                              response = table.scan(
+                                  FilterExpression=Attr('product_id').eq(product_id)
+                              )
+                              
+                              return {
+                                  'statusCode': 200,
+                                  'headers': headers,
+                                  'body': json.dumps({
+                                      'reviews': response.get('Items', [])
+                                  })
+                              }
+                      
+                      return {
+                          'statusCode': 400,
+                          'headers': headers,
+                          'body': json.dumps({
+                              'message': 'Missing product_id parameter'
+                          })
+                      }
+                  
+                  # Handle other cases
+                  return {
+                      'statusCode': 400,
+                      'headers': headers,
+                      'body': json.dumps({
+                          'message': 'Invalid request method or format'
+                      })
+                  }
+              
+              except Exception as e:
+                  # VULNERABLE ERROR HANDLING: Returning detailed error information
+                  return {
+                      'statusCode': 500,
+                      'headers': headers,
+                      'body': json.dumps({
+                          'message': 'Server error occurred',
+                          'error': str(e),
+                          'error_type': str(type(e).__name__)
+                      })
+                  }
+  
+  # Protected API Gateway
+  ProtectedApi:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: !Sub '${ProjectName}-protected-api-${Stage}'
+      Description: 'Protected API for AWS WAF demonstration'
+      EndpointConfiguration:
+        Types:
+          - REGIONAL
+  
+  # API Gateway resource
+  ProtectedApiResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref ProtectedApi
+      ParentId: !GetAtt ProtectedApi.RootResourceId
+      PathPart: 'reviews'
+  
+  # API Gateway methods
+  ProtectedApiPostMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref ProtectedApi
+      ResourceId: !Ref ProtectedApiResource
+      HttpMethod: POST
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${ProtectedLambdaFunction.Arn}/invocations'
+        IntegrationResponses:
+          - StatusCode: '200'
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Origin: !Sub "'https://${CloudFrontDistribution.DomainName}'"
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token,Origin,Accept'"
+              method.response.header.Access-Control-Allow-Methods: "'GET,POST,OPTIONS'"
+        PassthroughBehavior: WHEN_NO_MATCH
+        ContentHandling: CONVERT_TO_TEXT
+      MethodResponses:
+        - StatusCode: '200'
+          ResponseModels:
+            application/json: 'Empty'
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Origin: true
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+  
+  ProtectedApiGetMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref ProtectedApi
+      ResourceId: !Ref ProtectedApiResource
+      HttpMethod: GET
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${ProtectedLambdaFunction.Arn}/invocations'
+        IntegrationResponses:
+          - StatusCode: '200'
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Origin: !Sub "'https://${CloudFrontDistribution.DomainName}'"
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token,Origin,Accept'"
+              method.response.header.Access-Control-Allow-Methods: "'GET,POST,OPTIONS'"
+        PassthroughBehavior: WHEN_NO_MATCH
+        ContentHandling: CONVERT_TO_TEXT
+      MethodResponses:
+        - StatusCode: '200'
+          ResponseModels:
+            application/json: 'Empty'
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Origin: true
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+  
+  ProtectedApiOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref ProtectedApi
+      ResourceId: !Ref ProtectedApiResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        IntegrationResponses:
+          - StatusCode: '200'
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token,Origin,Accept'"
+              method.response.header.Access-Control-Allow-Methods: "'GET,POST,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: !Sub "'https://${CloudFrontDistribution.DomainName}'"
+            ResponseTemplates:
+              application/json: '{}'
+        PassthroughBehavior: WHEN_NO_MATCH
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+      MethodResponses:
+        - StatusCode: '200'
+          ResponseModels:
+            application/json: 'Empty'
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+  
+  # API Gateway deployment
+  ProtectedApiDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn:
+      - ProtectedApiPostMethod
+      - ProtectedApiGetMethod
+      - ProtectedApiOptionsMethod
+    Properties:
+      RestApiId: !Ref ProtectedApi
+      StageName: !Ref Stage
+      Description: !Sub 'Deployment for ${Stage} stage with CORS fix - ${AWS::StackName}-${AWS::Region}-${AWS::AccountId}-${AWS::StackId}'
+  
+  # Lambda permission for API Gateway
+  ProtectedApiGatewayPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref ProtectedLambdaFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${ProtectedApi}/*/*/*'
+  
+  #############################################
+  # AWS WAF Configuration
+  #############################################
+  
+  # WAF Web ACL
+  WafWebAcl:
+    Type: AWS::WAFv2::WebACL
+    Condition: CreateWafResources
+    Properties:
+      Name: !Sub '${ProjectName}-web-acl-${Stage}'
+      Scope: REGIONAL
+      Description: Web ACL for protecting API Gateway from common web exploits
+      DefaultAction:
+        Allow: {}
+      VisibilityConfig:
+        SampledRequestsEnabled: true
+        CloudWatchMetricsEnabled: true
+        MetricName: !Sub '${ProjectName}-web-acl-metric-${Stage}'
+      Rules:
+        # AWS Managed Rules - Core rule set
+        - Name: AWSManagedRulesCommonRuleSet
+          Priority: 0
+          OverrideAction:
+            None: {}
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: AWSManagedRulesCommonRuleSetMetric
+          Statement:
+            ManagedRuleGroupStatement:
+              VendorName: AWS
+              Name: AWSManagedRulesCommonRuleSet
+              ExcludedRules: []
+        
+        # AWS Managed Rules - SQL injection rule set
+        - Name: AWSManagedRulesSQLiRuleSet
+          Priority: 1
+          OverrideAction:
+            None: {}
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: AWSManagedRulesSQLiRuleSetMetric
+          Statement:
+            ManagedRuleGroupStatement:
+              VendorName: AWS
+              Name: AWSManagedRulesSQLiRuleSet
+              ExcludedRules: []
+        
+        # AWS Managed Rules - Linux OS rule set (protects against command injection)
+        - Name: AWSManagedRulesLinuxRuleSet
+          Priority: 2
+          OverrideAction:
+            None: {}
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: AWSManagedRulesLinuxRuleSetMetric
+          Statement:
+            ManagedRuleGroupStatement:
+              VendorName: AWS
+              Name: AWSManagedRulesLinuxRuleSet
+              ExcludedRules: []
+        
+        # Bot Control - Common bots
+        - Name: AWSManagedRulesBotControlRuleSet
+          Priority: 3
+          OverrideAction:
+            None: {}
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: AWSManagedRulesBotControlRuleSetMetric
+          Statement:
+            ManagedRuleGroupStatement:
+              VendorName: AWS
+              Name: AWSManagedRulesBotControlRuleSet
+              ExcludedRules: []
+        
+        # Rate-based rule for DDoS protection
+        - Name: RateBasedRule
+          Priority: 4
+          Action:
+            Block: {}
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: RateBasedRuleMetric
+          Statement:
+            RateBasedStatement:
+              Limit: 100
+              AggregateKeyType: IP
+              ScopeDownStatement:
+                ByteMatchStatement:
+                  FieldToMatch:
+                    UriPath: {}
+                  PositionalConstraint: STARTS_WITH
+                  SearchString: "/reviews"
+                  TextTransformations:
+                    - Type: LOWERCASE
+                      Priority: 0
+  
+  # WAF Web ACL Association with API Gateway
+  WebACLAssociation:
+    Type: AWS::WAFv2::WebACLAssociation
+    Condition: CreateWafResources
+    DependsOn: ProtectedApiDeployment
+    Properties:
+      ResourceArn: !Sub 'arn:aws:apigateway:${AWS::Region}::/restapis/${ProtectedApi}/stages/${Stage}'
+      WebACLArn: !GetAtt WafWebAcl.Arn
+  
+  # CloudWatch Dashboard for monitoring
+  MonitoringDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub '${ProjectName}-waf-monitoring-${Stage}'
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "text",
+              "x": 0,
+              "y": 0,
+              "width": 24,
+              "height": 2,
+              "properties": {
+                "markdown": "# AWS WAF Demonstration Dashboard\nMonitoring unprotected vs. protected API endpoints"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 2,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/ApiGateway", "Count", "ApiName", "${ProjectName}-unprotected-api-${Stage}", "Stage", "${Stage}", "Resource", "/reviews", "Method", "POST" ],
+                  [ "AWS/ApiGateway", "Count", "ApiName", "${ProjectName}-protected-api-${Stage}", "Stage", "${Stage}", "Resource", "/reviews", "Method", "POST" ]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "stat": "Sum",
+                "period": 60,
+                "title": "API Requests (Unprotected vs. Protected)"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 2,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/ApiGateway", "Latency", "ApiName", "${ProjectName}-unprotected-api-${Stage}", "Stage", "${Stage}", "Resource", "/reviews", "Method", "POST" ],
+                  [ "AWS/ApiGateway", "Latency", "ApiName", "${ProjectName}-protected-api-${Stage}", "Stage", "${Stage}", "Resource", "/reviews", "Method", "POST" ]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "stat": "Average",
+                "period": 60,
+                "title": "API Latency (Unprotected vs. Protected)"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 8,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/ApiGateway", "5XXError", "ApiName", "${ProjectName}-unprotected-api-${Stage}", "Stage", "${Stage}", "Resource", "/reviews", "Method", "POST" ],
+                  [ "AWS/ApiGateway", "5XXError", "ApiName", "${ProjectName}-protected-api-${Stage}", "Stage", "${Stage}", "Resource", "/reviews", "Method", "POST" ]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "stat": "Sum",
+                "period": 60,
+                "title": "5XX Errors (Unprotected vs. Protected)"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 8,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/Lambda", "Errors", "FunctionName", "${ProjectName}-unprotected-function-${Stage}" ],
+                  [ "AWS/Lambda", "Errors", "FunctionName", "${ProjectName}-protected-function-${Stage}" ]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "stat": "Sum",
+                "period": 60,
+                "title": "Lambda Errors (Unprotected vs. Protected)"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 14,
+              "width": 24,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/WAFv2", "BlockedRequests", "WebACL", "${ProjectName}-web-acl-${Stage}", "Rule", "ALL" ]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "stat": "Sum",
+                "period": 60,
+                "title": "WAF Blocked Requests"
+              }
+            }
+          ]
+        }
+
+Conditions:
+  CreateWafResources: !Equals [!Ref CreateWafProtection, 'true']
+
+Outputs:
+  UnprotectedApiEndpoint:
+    Description: 'Endpoint URL for the unprotected API'
+    Value: !Sub 'https://${UnprotectedApi}.execute-api.${AWS::Region}.amazonaws.com/${Stage}/reviews'
+  
+  ProtectedApiEndpoint:
+    Description: 'Endpoint URL for the protected API'
+    Value: !Sub 'https://${ProtectedApi}.execute-api.${AWS::Region}.amazonaws.com/${Stage}/reviews'
+  
+  FrontendURL:
+    Description: 'URL for the frontend website (CloudFront)'
+    Value: !GetAtt CloudFrontDistribution.DomainName
+  
+  MonitoringDashboardURL:
+    Description: 'URL for the CloudWatch monitoring dashboard'
+    Value: !Sub 'https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home#dashboards:name=${ProjectName}-waf-monitoring-${Stage}'
+  
+  DynamoDBTableName:
+    Description: 'Name of the DynamoDB table'
+    Value: !Ref ProductReviewsTable
+  
+  WebACLId:
+    Description: 'ID of the WAF Web ACL'
+    Value: !If [CreateWafResources, !GetAtt WafWebAcl.Id, 'WAF not enabled']
